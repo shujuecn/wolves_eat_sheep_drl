@@ -43,6 +43,8 @@ def main() -> None:
     ap.add_argument("--channels", type=int, default=None)
     ap.add_argument("--resume", action="store_true")
     ap.add_argument("--fresh", action="store_true", help="忽略已有 checkpoint 从零开始")
+    ap.add_argument("--fresh-schedule", action="store_true",
+                    help="续训时重启学习率余弦周期（配合 --lr/--iters 用作第二阶段）")
     args = ap.parse_args()
 
     from .config import Config
@@ -112,6 +114,7 @@ def main() -> None:
     start_iter = 0
     steps_done = 0
     games_total = 0
+    sched_base = 0
 
     if args.resume and os.path.exists(latest_pt):
         ck = torch.load(latest_pt, map_location=device, weights_only=False)
@@ -120,8 +123,12 @@ def main() -> None:
         start_iter = ck["iter"]
         steps_done = ck["steps"]
         games_total = ck.get("games_total", 0)
+        sched_base = ck.get("sched_base", 0)
         print(f"[train] 续训：iter={start_iter} steps={steps_done} games={games_total}",
               flush=True)
+    if args.fresh_schedule:
+        sched_base = steps_done
+        print(f"[train] 学习率周期重启：base_step={sched_base}", flush=True)
 
     # ---- 回放池（环形数组）----
     cap = cfg.buffer_size
@@ -272,7 +279,8 @@ def main() -> None:
             zt = torch.from_numpy(z_t).to(device)
 
             lr = (cfg.lr_min + 0.5 * (cfg.lr - cfg.lr_min)
-                  * (1 + math.cos(math.pi * min(1.0, steps_done / cfg.cosine_steps))))
+                  * (1 + math.cos(math.pi * min(1.0, max(0, steps_done - sched_base)
+                                                  / cfg.cosine_steps))))
             for gp in opt.param_groups:
                 gp["lr"] = lr
             logits, v = model(xt.float(), mt)
@@ -298,6 +306,7 @@ def main() -> None:
                 "iter": cur_iter,
                 "steps": steps_done,
                 "games_total": games_total,
+                "sched_base": sched_base,
                 "model": model.state_dict(),
                 "opt": opt.state_dict(),
                 "cfg_blocks": cfg.blocks,
@@ -353,6 +362,7 @@ def main() -> None:
         "iter": games_total // cfg.iter_games,
         "steps": steps_done,
         "games_total": games_total,
+        "sched_base": sched_base,
         "model": model.state_dict(),
         "opt": opt.state_dict(),
         "cfg_blocks": cfg.blocks,

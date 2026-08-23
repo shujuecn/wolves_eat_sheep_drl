@@ -281,6 +281,9 @@ def sample_positions(net, device, n_target: int, seed: int,
         for i, ps in enumerate(searches):
             if ps.done:
                 searches[i] = _PlaySearch(rng)
+        # 终止：收集量足够（留出打乱抽样余量）
+        if sum(len(v) for v in bucket.values()) >= n_target * 2:
+            break
 
     pool = [s for ks in bucket.values() for s in ks]
     rng.shuffle(pool)
