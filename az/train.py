@@ -203,7 +203,7 @@ def main() -> None:
     signal.signal(signal.SIGINT, _sigint)
     signal.signal(signal.SIGTERM, _sigint)
 
-    target_steps = cfg.total_iters * cfg.steps_per_iter
+    target_steps = sched_base + cfg.total_iters * cfg.steps_per_iter
     bs = cfg.batch_size
     model.train()
     t0 = time.time()
