@@ -447,6 +447,7 @@ def main() -> None:
     ap.add_argument("--sims", type=int, default=600)
     ap.add_argument("--c-puct", type=float, default=1.7)
     ap.add_argument("--n-match", type=int, default=300, help="自弈达成率抽样数")
+    ap.add_argument("--cont-sims", type=int, default=200, help="自弈达成率每步模拟数")
     ap.add_argument("--out-dir", default="results")
     ap.add_argument("--seed", type=int, default=7)
     ap.add_argument("--tag", default="")
@@ -522,7 +523,7 @@ def main() -> None:
     # ---- 自弈达成率 ----
     rng = random.Random(args.seed + 1)
     match_idx = rng.sample(range(n), min(args.n_match, n))
-    conts = [Continuation(done_rows[i]["s"], 200, args.c_puct) for i in match_idx]
+    conts = [Continuation(done_rows[i]["s"], args.cont_sims, args.c_puct) for i in match_idx]
     t0 = time.time()
     batched_continuations(conts, forward)
     n_ach = 0

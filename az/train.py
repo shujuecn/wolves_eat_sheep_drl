@@ -207,6 +207,8 @@ def main() -> None:
     signal.signal(signal.SIGTERM, _sigint)
 
     target_steps = sched_base + cfg.total_iters * cfg.steps_per_iter
+    games_base = games_total
+    steps_base = steps_done
     bs = cfg.batch_size
     model.train()
     t0 = time.time()
@@ -257,8 +259,9 @@ def main() -> None:
         except pyqueue.Empty:
             pass
 
-        # ---- 3) 训练步（按对局到达速度配速）----
-        desired = games_total * cfg.steps_per_iter // cfg.iter_games
+        # ---- 3) 训练步（按本阶段对局到达速度配速）----
+        desired = steps_base + ((games_total - games_base) * cfg.steps_per_iter
+                                // cfg.iter_games)
         done_here = 0
         while (steps_done < target_steps and done_here < 8
                and desired > steps_done and buf_len >= cfg.min_buffer):
