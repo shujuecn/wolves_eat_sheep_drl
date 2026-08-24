@@ -16,7 +16,7 @@ class Config:
     root: str = field(default_factory=_repo_root)
     model_dir: str = "data/models"
     log_dir: str = "logs"
-    tb_dir: str = "data/ws_tb_dtc_v2_c"   # 硬解表库目录（评估用）
+    tb_dir: str = "wolves_eat_sheep_hard_solve/data/ws_tb_dtc_v2_c"  # 硬解表库（子仓库内）
 
     # 自对弈
     actors: int = 20            # 自对弈进程数

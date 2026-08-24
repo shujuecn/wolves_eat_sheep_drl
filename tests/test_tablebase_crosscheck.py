@@ -23,9 +23,10 @@ sys.path.insert(0, str(SUB))
 import hard_solve_fast as hsf  # noqa: E402 子仓库参考实现（只读）
 
 from az import game  # noqa: E402
+from az.game import DRAW  # noqa: E402
 from az.tablebase import Tablebase, encode_sheep_cells, encode_wolf_bb, bits_cells  # noqa: E402
 
-TB_DIR = ROOT / "data" / "ws_tb_dtc_v2_c"
+TB_DIR = SUB / "data" / "ws_tb_dtc_v2_c"
 
 
 class RefReader:
@@ -143,8 +144,7 @@ def main() -> None:
         if kn and r2 == DRAW:
             best_acts.append(a)
     mv = [game.action_to_move(a) for a in best_acts]
-    center_jump = [(22, 12, 12)]
-    assert center_jump in mv, f"center jump missing in optimal set: {mv}"
+    assert (22, 12, 12) in mv, f"center jump missing in optimal set: {mv}"
 
     # 羊方在狼中路跳吃后的局面应可达成羊胜或和棋（按表库）
     cj = (22, 12, 12)

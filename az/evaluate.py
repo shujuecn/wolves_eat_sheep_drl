@@ -48,7 +48,14 @@ class EvalSearch:
         return self.sims_done >= self.sims and self.pending is None
 
     def advance(self):
-        assert not self.done
+        """推进一次模拟。
+
+        返回 (planes, mask) 表示需要网络评估；
+        返回 None 表示本模拟无需评估（终局精确价值备份）或搜索已完成。
+        调用方用 .done 区分两种情形。
+        """
+        if self.done:
+            return None
         while True:
             if self.sims_done >= self.sims:
                 return None
@@ -121,9 +128,11 @@ class EvalSearch:
         return sum(self.root.W) / max(sum(self.root.N), 1)
 
 
-def batched_eval_searches(searches: list[EvalSearch], forward, log_every=0):
+def batched_eval_searches(searches: list[EvalSearch], forward,
+                          progress_every: int = 0, tag: str = ""):
     """把多个 EvalSearch 的叶请求合并成批送入 forward(planes,masks)->(pol,val)。"""
     active = [s for s in searches if not s.done]
+    rounds = 0
     while active:
         idxs, planes_l, masks_l = [], [], []
         for i, se in enumerate(active):
@@ -138,8 +147,10 @@ def batched_eval_searches(searches: list[EvalSearch], forward, log_every=0):
         for j, i in enumerate(idxs):
             active[i].receive(pol[j].tolist(), float(val[j]))
         active = [s for s in active if not s.done]
-        if log_every and random.random() < log_every:
-            pass
+        rounds += 1
+        if progress_every and rounds % progress_every == 0:
+            print(f"[eval] {tag} 搜索轮次 {rounds}，剩余 {len(active)}",
+                  flush=True)
 
 
 def forward_factory(net, device):
@@ -234,14 +245,58 @@ def tb_perfect_action(tb: Tablebase, s: State) -> int:
 # ----------------------------------------------------------------
 # 局面采样：模型自对弈轨迹去重
 # ----------------------------------------------------------------
+def _capture_biased_walk_positions(rng: random.Random, quota_per_k: int,
+                                   max_plies: int = 4_000_000) -> list[State]:
+    """狼偏好吃子的随机游走，采集低羊数（k<=11）真实可达局面。"""
+    out: list[State] = []
+    cnt: dict[int, int] = defaultdict(int)
+    plies = 0
+    while plies < max_plies:
+        env = game.Env()
+        while plies < max_plies:
+            st = env.state
+            res = game.immediate_result(st)
+            if res != ONGOING or st.ply >= game.MAX_PLY:
+                break
+            acts = game.legal_actions(st)
+            if st.turn == 1:  # 狼：一半概率只考虑跳吃
+                caps = [a for a in acts if a & 1]
+                if caps and rng.random() < 0.5:
+                    acts = caps
+            key = (st.sheep, st.wolf, st.turn)
+            k = st.sheep.bit_count()
+            if key not in seen_keys and k <= 11 and cnt[k] < quota_per_k:
+                seen_keys.add(key)
+                cnt[k] += 1
+                out.append(st)
+            env.step(rng.choice(acts))
+            plies += 1
+        if all(cnt[k] >= quota_per_k for k in range(4, 12)):
+            break
+    return out
+
+
+seen_keys: set = set()
+
+
 def sample_positions(net, device, n_target: int, seed: int,
                      n_games: int = 40, sims: int = 96,
-                     max_per_k: int = 400) -> list[State]:
+                     max_per_k: int = 400, min_per_k: int = 80) -> list[State]:
+    """分层采样：先随机+吃子偏好游走补齐各 k 配额，再用模型自对弈轨迹填充。"""
     rng = random.Random(seed)
-    searches = [_PlaySearch(rng) for _ in range(n_games)]
-    seen: set[tuple] = set()
-    bucket: dict[int, list] = defaultdict(list)
 
+    # 1) 无模型阶段：随机游走（含吃子偏好）保证低 k 覆盖
+    pool: list[State] = []
+    cnt: dict[int, int] = defaultdict(int)
+    walk_pos = _capture_biased_walk_positions(rng, min_per_k * 3)
+    for st in walk_pos:
+        k = st.sheep.bit_count()
+        if cnt[k] < max_per_k:
+            cnt[k] += 1
+            pool.append(st)
+
+    # 2) 模型自对弈轨迹补充（更贴近实际对局分布）
+    searches = [_PlaySearch(random.Random(seed + 7)) for _ in range(n_games)]
     import torch
 
     @torch.inference_mode()
@@ -251,41 +306,53 @@ def sample_positions(net, device, n_target: int, seed: int,
         logits, v = net(x, m)
         return torch.softmax(logits, 1).cpu().numpy(), v.cpu().numpy()
 
-    while any(not ps.done for ps in searches):
+    rounds_without_progress = 0
+    while True:
         idxs, planes_l, masks_l = [], [], []
+        any_active = False
         for i, ps in enumerate(searches):
             if ps.done:
                 continue
+            any_active = True
             r = ps.advance()
             if r is not None:
                 idxs.append(i)
                 planes_l.append(r[0])
                 masks_l.append(r[1])
-        if not planes_l:
+        if not any_active:
             break
-        pol, val = fwd(np.stack(planes_l), np.stack(masks_l))
-        for j, i in enumerate(idxs):
-            searches[i].receive(pol[j].tolist(), float(val[j]))
-        # 收集刚到达的局面（去重 + 分桶）
+        if planes_l:
+            pol, val = fwd(np.stack(planes_l), np.stack(masks_l))
+            for j, i in enumerate(idxs):
+                searches[i].receive(pol[j].tolist(), float(val[j]))
+        # 收集新到达的局面
+        progressed = False
         for i in idxs:
             st = searches[i].env.state
             key = (st.sheep, st.wolf, st.turn)
-            if key in seen or game.immediate_result(st) != ONGOING:
+            if key in seen_keys or game.immediate_result(st) != ONGOING:
                 continue
             k = st.sheep.bit_count()
-            if len(bucket[k]) >= max_per_k:
-                continue
-            seen.add(key)
-            bucket[k].append(st)
-        # 完局重开
+            if cnt[k] < max_per_k:
+                seen_keys.add(key)
+                cnt[k] += 1
+                pool.append(st)
+                progressed = True
         for i, ps in enumerate(searches):
             if ps.done:
-                searches[i] = _PlaySearch(rng)
-        # 终止：收集量足够（留出打乱抽样余量）
-        if sum(len(v) for v in bucket.values()) >= n_target * 2:
+                searches[i] = _PlaySearch(random.Random(seed + 7 + i))
+        # 终止条件：总量足够且没有 k 缺口
+        total = len(pool)
+        gaps = [k for k in range(4, 16) if cnt[k] < min_per_k]
+        if total >= n_target * 2 and not gaps:
             break
+        if not progressed:
+            rounds_without_progress += 1
+            if rounds_without_progress > 50:
+                break
+        else:
+            rounds_without_progress = 0
 
-    pool = [s for ks in bucket.values() for s in ks]
     rng.shuffle(pool)
     return pool[:n_target]
 
@@ -313,6 +380,65 @@ class _PlaySearch:
 # ----------------------------------------------------------------
 # 主流程
 # ----------------------------------------------------------------
+class Continuation:
+    """从给定局面开始让模型自弈到终局（协作式，可批量并发）。"""
+
+    def __init__(self, start: State, sims: int, c_puct: float):
+        self.st = start._replace(ply=0)
+        self.sims = sims
+        self.c_puct = c_puct
+        self.search: EvalSearch | None = None
+        self.done = False
+        self.final: int | None = None
+        self._check_terminal()
+
+    def _check_terminal(self) -> None:
+        res = game.immediate_result(self.st)
+        if res != ONGOING:
+            self.final = res
+            self.done = True
+        elif self.st.ply >= game.MAX_PLY:
+            self.final = DRAW
+            self.done = True
+
+    def advance(self):
+        if self.done:
+            return None
+        # 搜索已完成：落子并推进局面
+        while self.search is not None and self.search.done:
+            a = self.search.best_action()
+            self.st = game.apply_action(self.st, a)
+            self.search = None
+            self._check_terminal()
+            if self.done:
+                return None
+        if self.search is None:
+            self.search = EvalSearch(self.st, self.sims, self.c_puct)
+        r = self.search.advance()
+        if r is not None:
+            return r
+        # r=None：本次消耗了终局模拟或搜索刚完成；交由下一轮用 done 判断
+        return None
+
+
+def batched_continuations(conts: list[Continuation], forward) -> None:
+    active = [c for c in conts if not c.done]
+    while active:
+        idxs, planes_l, masks_l = [], [], []
+        for i, c in enumerate(active):
+            r = c.advance()
+            if r is not None:
+                idxs.append(i)
+                planes_l.append(r[0])
+                masks_l.append(r[1])
+        if not planes_l:
+            break
+        pol, val = forward(np.stack(planes_l), np.stack(masks_l))
+        for j, i in enumerate(idxs):
+            active[i].search.receive(pol[j].tolist(), float(val[j]))
+        active = [c for c in active if not c.done]
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--ckpt", default="data/models/latest.pt")
@@ -345,34 +471,50 @@ def main() -> None:
     print(f"[eval] 采样完成：{len(positions)} 局面，{time.time()-t0:.0f}s", flush=True)
 
     forward = forward_factory(net, device)
-    searches = [EvalSearch(s, args.sims, args.c_puct) for s in positions]
-    t0 = time.time()
-    batched_eval_searches(searches, forward)
-    print(f"[eval] MCTS({args.sims} sims) 完成：{time.time()-t0:.0f}s", flush=True)
-
-    # ---- 逐局面指标 ----
+    # 分块搜索 + 逐块统计（抗长跑中断，可观测进度）
+    import faulthandler
+    faulthandler.enable()
+    CHUNK = 240
     n_opt = n_strict = n_value = 0
-    per_k = defaultdict(lambda: [0, 0, 0, 0])  # k -> [n, opt, strict, value]
+    per_k = defaultdict(lambda: [0, 0, 0, 0])
     cls_dist = defaultdict(int)
-    for s, se in zip(positions, searches):
-        value_set, strict_set, cls, dist = optimal_sets(tb, s)
-        a_star = se.best_action()
-        v_est = se.root_value()
-        ok_opt = a_star in value_set
-        ok_strict = a_star in strict_set
-        v_cls = 1 if v_est > 0.33 else (-1 if v_est < -0.33 else 0)
-        ok_val = v_cls == cls
-        n_opt += ok_opt
-        n_strict += ok_strict
-        n_value += ok_val
-        row = per_k[s.sheep.bit_count()]
-        row[0] += 1
-        row[1] += ok_opt
-        row[2] += ok_strict
-        row[3] += ok_val
-        cls_dist[cls] += 1
+    done_rows: list[dict] = []
+    t_search = time.time()
+    for c0 in range(0, len(positions), CHUNK):
+        chunk = positions[c0:c0 + CHUNK]
+        searches = [EvalSearch(s, args.sims, args.c_puct) for s in chunk]
+        batched_eval_searches(searches, forward,
+                              progress_every=100,
+                              tag=f"chunk{c0//CHUNK}")
+        for s, se in zip(chunk, searches):
+            value_set, strict_set, cls, dist = optimal_sets(tb, s)
+            a_star = se.best_action()
+            v_est = se.root_value()
+            ok_opt = a_star in value_set
+            ok_strict = a_star in strict_set
+            v_cls = 1 if v_est > 0.33 else (-1 if v_est < -0.33 else 0)
+            ok_val = v_cls == cls
+            n_opt += ok_opt
+            n_strict += ok_strict
+            n_value += ok_val
+            row = per_k[s.sheep.bit_count()]
+            row[0] += 1
+            row[1] += ok_opt
+            row[2] += ok_strict
+            row[3] += ok_val
+            cls_dist[cls] += 1
+            done_rows.append({"s": s, "cls": cls})
+        el = time.time() - t_search
+        n_done = len(done_rows)
+        print(f"[eval] 进度 {n_done}/{len(positions)} "
+              f"最优={100*n_opt/n_done:.2f}% 严格={100*n_strict/n_done:.2f}% "
+              f"价值={100*n_value/n_done:.2f}% （{el:.0f}s）", flush=True)
+        # 增量落盘，中断不丢
+        with open(os.path.join(args.out_dir, f"partial_{args.tag or 'eval'}.json"), "w") as f:
+            json.dump({"done": n_done, "opt": n_opt, "strict": n_strict,
+                       "value": n_value}, f)
 
-    n = len(positions)
+    n = len(done_rows)
     m_opt = n_opt / n
     m_strict = n_strict / n
     m_value = n_value / n
@@ -380,27 +522,25 @@ def main() -> None:
     # ---- 自弈达成率 ----
     rng = random.Random(args.seed + 1)
     match_idx = rng.sample(range(n), min(args.n_match, n))
+    conts = [Continuation(done_rows[i]["s"], 200, args.c_puct) for i in match_idx]
+    t0 = time.time()
+    batched_continuations(conts, forward)
     n_ach = 0
-    for i in match_idx:
-        s = positions[i]
-        _, _, cls, _dist = optimal_sets(tb, s)
-        # 纯规则推进（表库不建模重复规则，与求解器口径一致）
-        st = s._replace(ply=0)
-        final = DRAW
-        while True:
-            res = game.immediate_result(st)
-            if res != ONGOING:
-                final = res
-                break
-            if st.ply >= game.MAX_PLY:
-                final = DRAW
-                break
-            se = EvalSearch(st, 200, args.c_puct)
-            batched_eval_searches([se], forward)
-            st = game.apply_action(st, se.best_action())
-        got_cls = mover_class(final, s)
-        n_ach += got_cls == cls
+    ach_by_cls = defaultdict(lambda: [0, 0])  # cls -> [n, ach]
+    for c, i in zip(conts, match_idx):
+        cls = done_rows[i]["cls"]
+        got = mover_class(c.final, done_rows[i]["s"])
+        ok = got == cls
+        n_ach += ok
+        ach_by_cls[cls][0] += 1
+        ach_by_cls[cls][1] += ok
     m_achieve = n_ach / len(match_idx)
+    print(f"[eval] 自弈达成率阶段完成：{time.time()-t0:.0f}s", flush=True)
+    for c in (1, 0, -1):
+        nn, aa = ach_by_cls[c]
+        if nn:
+            name = {1: "胜面", 0: "和面", -1: "负面"}[c]
+            print(f"[eval]   真值{name}: {aa}/{nn} = {100*aa/nn:.1f}%", flush=True)
 
     # ---- 报告 ----
     os.makedirs(args.out_dir, exist_ok=True)

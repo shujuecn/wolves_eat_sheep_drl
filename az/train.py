@@ -37,6 +37,7 @@ def main() -> None:
     ap.add_argument("--steps-per-iter", type=int, default=None)
     ap.add_argument("--batch-size", type=int, default=None)
     ap.add_argument("--lr", type=float, default=None)
+    ap.add_argument("--temp-moves", type=int, default=None)
     ap.add_argument("--min-buffer", type=int, default=None)
     ap.add_argument("--buffer-size", type=int, default=None)
     ap.add_argument("--blocks", type=int, default=None)
@@ -65,6 +66,8 @@ def main() -> None:
         cfg.batch_size = args.batch_size
     if args.lr is not None:
         cfg.lr = args.lr
+    if args.temp_moves is not None:
+        cfg.temp_moves = args.temp_moves
     if args.min_buffer is not None:
         cfg.min_buffer = args.min_buffer
     if args.buffer_size is not None:

@@ -341,5 +341,6 @@ class Tablebase:
 def load_tablebase(data_dir: str | None = None) -> Tablebase:
     if data_dir is None:
         root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        data_dir = os.path.join(root, "data", "ws_tb_dtc_v2_c")
+        data_dir = os.path.join(
+            root, "wolves_eat_sheep_hard_solve", "data", "ws_tb_dtc_v2_c")
     return Tablebase(data_dir)
