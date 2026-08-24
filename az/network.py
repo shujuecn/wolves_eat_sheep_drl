@@ -78,9 +78,14 @@ class AlphaZeroNet(nn.Module):
         """推理辅助：planes uint8 (B,3,5,5)，masks bool (B,200)。"""
         was_training = self.training
         self.eval()
-        x = planes.to(next(self.parameters()).device, non_blocking=True).float()
-        m = masks.to(x.device)
-        logits, v = self.forward(x, m)
+        dev = next(self.parameters()).device
+        x = planes.to(dev, non_blocking=True)
+        m = masks.to(dev)
+        with torch.autocast(dev.type, dtype=torch.bfloat16,
+                            enabled=(dev.type == "cuda")):
+            logits, v = self.forward(x.float(), m)
+        logits = logits.float()
+        v = v.float()
         if was_training:
             self.train()
         return logits, v

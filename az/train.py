@@ -107,6 +107,7 @@ def main() -> None:
     import torch.nn.functional as F
     from torch.optim import AdamW
 
+    torch.backends.cudnn.benchmark = True
     from .encode import FLIP_PERM
     from .network import AlphaZeroNet
 
