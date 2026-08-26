@@ -1,6 +1,7 @@
 __pycache__/
 *.pyc
 .ipynb_checkpoints/
+.vscode/
 
 # 数据与产物（不入库）
 data/ws_tb_dtc_v2_c/

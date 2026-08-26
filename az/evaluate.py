@@ -439,6 +439,77 @@ def batched_continuations(conts: list[Continuation], forward) -> None:
         active = [c for c in active if not c.done]
 
 
+class VsPerfectGame:
+    """模型 vs 表库完美引擎：model_side 指定模型执哪一方（1=狼 0=羊）。
+
+    协作式推进（可批量）；模型每步用 EvalSearch(sims)，对手用表库最优应手。
+    """
+
+    def __init__(self, start: State, model_side: int, sims: int, c_puct: float,
+                 tb: Tablebase):
+        self.st = start._replace(ply=0)
+        self.model_side = model_side
+        self.sims = sims
+        self.c_puct = c_puct
+        self.tb = tb
+        self.search: EvalSearch | None = None
+        self.done = False
+        self.final: int | None = None
+        self._check_terminal()
+
+    def _check_terminal(self) -> None:
+        res = game.immediate_result(self.st)
+        if res != ONGOING:
+            self.final = res
+            self.done = True
+        elif self.st.ply >= game.MAX_PLY:
+            self.final = DRAW
+            self.done = True
+
+    def advance(self):
+        if self.done:
+            return None
+        # 完成上一手模型的搜索
+        while self.search is not None and self.search.done:
+            a = self.search.best_action()
+            self.search = None
+            self.st = game.apply_action(self.st, a)
+            self._check_terminal()
+            if self.done:
+                return None
+        if self.search is None:
+            # 对手回合：表库完美应手
+            if self.st.turn != self.model_side:
+                opp = tb_perfect_action(self.tb, self.st)
+                self.st = game.apply_action(self.st, opp)
+                self._check_terminal()
+                if self.done:
+                    return None
+            self.search = EvalSearch(self.st, self.sims, self.c_puct)
+        r = self.search.advance()
+        if r is not None:
+            return r
+        return None
+
+
+def batched_vs_perfect(games: list[VsPerfectGame], forward) -> None:
+    active = [g for g in games if not g.done]
+    while active:
+        idxs, planes_l, masks_l = [], [], []
+        for i, g in enumerate(active):
+            r = g.advance()
+            if r is not None:
+                idxs.append(i)
+                planes_l.append(r[0])
+                masks_l.append(r[1])
+        if not planes_l:
+            break
+        pol, val = forward(np.stack(planes_l), np.stack(masks_l))
+        for j, i in enumerate(idxs):
+            active[i].search.receive(pol[j].tolist(), float(val[j]))
+        active = [g for g in active if not g.done]
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--ckpt", default="data/models/latest.pt")
@@ -448,6 +519,7 @@ def main() -> None:
     ap.add_argument("--c-puct", type=float, default=1.7)
     ap.add_argument("--n-match", type=int, default=300, help="自弈达成率抽样数")
     ap.add_argument("--cont-sims", type=int, default=200, help="自弈达成率每步模拟数")
+    ap.add_argument("--vp-sims", type=int, default=400, help="对抗完美引擎时模型每步模拟数")
     ap.add_argument("--out-dir", default="results")
     ap.add_argument("--seed", type=int, default=7)
     ap.add_argument("--tag", default="")
@@ -542,6 +614,35 @@ def main() -> None:
         if nn:
             name = {1: "胜面", 0: "和面", -1: "负面"}[c]
             print(f"[eval]   真值{name}: {aa}/{nn} = {100*aa/nn:.1f}%", flush=True)
+
+    # ---- 对抗硬解完美引擎（能力相似的最直接度量）----
+    vp_n = min(args.n_match, n)
+    vp_idx = rng.sample(range(n), vp_n)
+    t0 = time.time()
+    res_by_mode = {"model_mover": [0, 0], "model_defender": [0, 0]}
+    for mode, model_side_pick in (("model_mover", None), ("model_defender", None)):
+        games = []
+        metas = []
+        for i in vp_idx:
+            s = done_rows[i]["s"]
+            known, abs_r, _d = tb.lookup_state(s)
+            mover_is_wolf = s.turn == 1
+            # 模型执"表库结论的胜方"（胜面时）或回合方（和/负时按表库最优应对）
+            if mode == "model_mover":
+                ms = s.turn
+            else:
+                ms = 0 if s.turn == 1 else 1
+            games.append(VsPerfectGame(s, ms, args.vp_sims, args.c_puct, tb))
+            metas.append((mover_class(abs_r, s), s))
+        batched_vs_perfect(games, forward)
+        for g, (cls, s) in zip(games, metas):
+            got = mover_class(g.final, s)
+            ok = got == cls
+            res_by_mode[mode][0] += 1
+            res_by_mode[mode][1] += ok
+        print(f"[eval] {mode}: {res_by_mode[mode][1]}/{res_by_mode[mode][0]} "
+              f"= {100*res_by_mode[mode][1]/max(1,res_by_mode[mode][0]):.1f}% "
+              f"（{time.time()-t0:.0f}s）", flush=True)
 
     # ---- 报告 ----
     os.makedirs(args.out_dir, exist_ok=True)
